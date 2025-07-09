@@ -90,6 +90,14 @@ detect_disks() {
     for disk in "${SYSTEM_DISKS[@]}"; do
         QEMU_DISKS_ARRAY+=("-drive" "file=/dev/$disk,format=raw,media=disk,if=virtio")
     done
+    
+    # Validate we have disks configured
+    if [ ${#QEMU_DISKS_ARRAY[@]} -eq 0 ]; then
+        echo -e "${CLR_RED}Error: No QEMU disks configured!${CLR_RESET}"
+        exit 1
+    fi
+    
+    echo -e "${CLR_BLUE}Debug: QEMU disk arguments: ${QEMU_DISKS_ARRAY[*]}${CLR_RESET}"
 }
 
 # Function to get user input
@@ -244,7 +252,24 @@ EOF
 
 make_autoinstall_iso() {
     echo -e "${CLR_BLUE}Making autoinstall.iso...${CLR_RESET}"
+    
+    if [ ! -f "pve.iso" ]; then
+        echo -e "${CLR_RED}Error: pve.iso not found!${CLR_RESET}"
+        exit 1
+    fi
+    
+    if [ ! -f "answer.toml" ]; then
+        echo -e "${CLR_RED}Error: answer.toml not found!${CLR_RESET}"
+        exit 1
+    fi
+    
     proxmox-auto-install-assistant prepare-iso pve.iso --fetch-from iso --answer-file answer.toml --output pve-autoinstall.iso
+    
+    if [ ! -f "pve-autoinstall.iso" ]; then
+        echo -e "${CLR_RED}Error: Failed to create pve-autoinstall.iso!${CLR_RESET}"
+        exit 1
+    fi
+    
     echo -e "${CLR_GREEN}pve-autoinstall.iso created.${CLR_RESET}"
 }
 
@@ -252,9 +277,23 @@ is_uefi_mode() {
   [ -d /sys/firmware/efi ]
 }
 
+# Check if KVM is available
+check_kvm() {
+    if [ ! -e /dev/kvm ]; then
+        echo -e "${CLR_YELLOW}Warning: KVM not available, using software emulation (will be slower)${CLR_RESET}"
+        KVM_OPTS=""
+    else
+        echo -e "${CLR_GREEN}KVM acceleration available${CLR_RESET}"
+        KVM_OPTS="-enable-kvm"
+    fi
+}
+
 # Install Proxmox via QEMU/VNC
 install_proxmox() {
     echo -e "${CLR_GREEN}Starting Proxmox VE installation...${CLR_RESET}"
+
+    # Check KVM availability
+    check_kvm
 
     if is_uefi_mode; then
         UEFI_OPTS="-bios /usr/share/ovmf/OVMF.fd"
@@ -267,16 +306,37 @@ install_proxmox() {
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
     echo -e "${CLR_RED}Do NOT do anything, just wait about 5-10 min!${CLR_RED}"
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
+    
+    # Debug: Show the command we're about to run
+    echo -e "${CLR_BLUE}Debug: Running QEMU with system disks: ${SYSTEM_DISKS[*]}${CLR_RESET}"
+    
+    # Run QEMU and capture exit code
+    set +e  # Temporarily disable exit on error
     qemu-system-x86_64 \
-        -enable-kvm "$UEFI_OPTS" \
+        $KVM_OPTS "$UEFI_OPTS" \
         -cpu host -smp 4 -m 4096 \
         -boot d -cdrom ./pve-autoinstall.iso \
-        "${QEMU_DISKS_ARRAY[@]}" -no-reboot -display none > /dev/null 2>&1
+        "${QEMU_DISKS_ARRAY[@]}" -no-reboot -display none > qemu_install.log 2>&1
+    
+    QEMU_EXIT_CODE=$?
+    set -e  # Re-enable exit on error
+    
+    if [ $QEMU_EXIT_CODE -ne 0 ]; then
+        echo -e "${CLR_RED}QEMU installation failed with exit code: $QEMU_EXIT_CODE${CLR_RESET}"
+        echo -e "${CLR_YELLOW}QEMU output:${CLR_RESET}"
+        cat qemu_install.log
+        exit 1
+    fi
+    
+    echo -e "${CLR_GREEN}Proxmox installation completed successfully!${CLR_RESET}"
 }
 
 # Function to boot the installed Proxmox via QEMU with port forwarding
 boot_proxmox_with_port_forwarding() {
     echo -e "${CLR_GREEN}Booting installed Proxmox with SSH port forwarding...${CLR_RESET}"
+
+    # Check KVM availability
+    check_kvm
 
     if is_uefi_mode; then
         UEFI_OPTS="-bios /usr/share/ovmf/OVMF.fd"
@@ -287,7 +347,7 @@ boot_proxmox_with_port_forwarding() {
     fi
     # UEFI_OPTS=""
     # Start QEMU in background with port forwarding
-    nohup qemu-system-x86_64 -enable-kvm "$UEFI_OPTS" \
+    nohup qemu-system-x86_64 $KVM_OPTS "$UEFI_OPTS" \
         -cpu host -device e1000,netdev=net0 \
         -netdev user,id=net0,hostfwd=tcp::5555-:22 \
         -smp 4 -m 4096 \

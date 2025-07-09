@@ -33,14 +33,14 @@ detect_disks() {
     
     echo -e "${CLR_YELLOW}Available disks:${CLR_RESET}"
     for disk in "${AVAILABLE_DISKS[@]}"; do
-        SIZE=$(lsblk -nd -o SIZE /dev/$disk)
+        SIZE=$(lsblk -nd -o SIZE /dev/"$disk")
         echo "  /dev/$disk ($SIZE)"
     done
     
     # Configure disk setup based on number of disks
     DISK_COUNT=${#AVAILABLE_DISKS[@]}
     
-    if [ $DISK_COUNT -eq 1 ]; then
+    if [ "$DISK_COUNT" -eq 1 ]; then
         DISK_SETUP="single"
         DISK_LIST="[\"/dev/${AVAILABLE_DISKS[0]}\"]"
         echo -e "${CLR_YELLOW}Single disk detected: /dev/${AVAILABLE_DISKS[0]} - will use ZFS single disk${CLR_RESET}"
@@ -71,9 +71,9 @@ detect_disks() {
         echo -e "${CLR_YELLOW}Odd number of disks detected ($DISK_COUNT) - will create $((PAIR_COUNT/2)) RAID1 mirror(s) and 1 single disk${CLR_RESET}"
     fi
     
-    QEMU_DISKS=""
+    QEMU_DISKS_ARRAY=()
     for disk in "${AVAILABLE_DISKS[@]}"; do
-        QEMU_DISKS+=" -drive file=/dev/$disk,format=raw,media=disk,if=virtio"
+        QEMU_DISKS_ARRAY+=("-drive" "file=/dev/$disk,format=raw,media=disk,if=virtio")
     done
 }
 
@@ -97,7 +97,7 @@ get_system_inputs() {
     fi
     
     # Prompt user for interface name
-    read -e -p "Interface name (options are: ${AVAILABLE_ALTNAMES}) : " -i "$INTERFACE_NAME" INTERFACE_NAME
+    read -er -p "Interface name (options are: ${AVAILABLE_ALTNAMES}) : " -i "$INTERFACE_NAME" INTERFACE_NAME
     
     # Now get network information based on the selected interface
     MAIN_IPV4_CIDR=$(ip address show "$INTERFACE_NAME" | grep global | grep "inet " | xargs | cut -d" " -f2)
@@ -125,12 +125,12 @@ get_system_inputs() {
     echo "IPv6: $MAIN_IPV6"
     
     # Get user input for other configuration
-    read -e -p "Enter your hostname : " -i "proxmox-example" HOSTNAME
-    read -e -p "Enter your FQDN name : " -i "proxmox.example.com" FQDN
-    read -e -p "Enter your timezone : " -i "Europe/Istanbul" TIMEZONE
-    read -e -p "Enter your email address: " -i "admin@example.com" EMAIL
-    read -e -p "Enter your private subnet : " -i "192.168.26.0/24" PRIVATE_SUBNET
-    read -e -p "Enter your System New root password: " NEW_ROOT_PASSWORD
+    read -er -p "Enter your hostname : " -i "proxmox" HOSTNAME
+    read -er -p "Enter your FQDN name : " -i "proxmox.e.com" FQDN
+    read -er -p "Enter your timezone : " -i "America/Phoenix" TIMEZONE
+    read -er -p "Enter your email address: " -i "a@e.com" EMAIL
+    read -er -p "Enter your private subnet : " -i "192.168.1.10/24" PRIVATE_SUBNET
+    read -er -p "Enter your System New root password: " NEW_ROOT_PASSWORD
     
     # Get the network prefix (first three octets) from PRIVATE_SUBNET
     PRIVATE_CIDR=$(echo "$PRIVATE_SUBNET" | cut -d'/' -f1 | rev | cut -d'.' -f2- | rev)
@@ -145,7 +145,7 @@ get_system_inputs() {
     while [[ -z "$NEW_ROOT_PASSWORD" ]]; do
         # Print message in a new line
         echo ""
-        read -e -p "Enter your System New root password: " NEW_ROOT_PASSWORD
+        read -er -p "Enter your System New root password: " NEW_ROOT_PASSWORD
     done
 
     echo ""
@@ -250,10 +250,10 @@ install_proxmox() {
     echo -e "${CLR_RED}Do NOT do anything, just wait about 5-10 min!${CLR_RED}"
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
     qemu-system-x86_64 \
-        -enable-kvm $UEFI_OPTS \
+        -enable-kvm "$UEFI_OPTS" \
         -cpu host -smp 4 -m 4096 \
         -boot d -cdrom ./pve-autoinstall.iso \
-        $QEMU_DISKS -no-reboot -display none > /dev/null 2>&1
+        "${QEMU_DISKS_ARRAY[@]}" -no-reboot -display none > /dev/null 2>&1
 }
 
 # Function to boot the installed Proxmox via QEMU with port forwarding
@@ -269,11 +269,11 @@ boot_proxmox_with_port_forwarding() {
     fi
     # UEFI_OPTS=""
     # Start QEMU in background with port forwarding
-    nohup qemu-system-x86_64 -enable-kvm $UEFI_OPTS \
+    nohup qemu-system-x86_64 -enable-kvm "$UEFI_OPTS" \
         -cpu host -device e1000,netdev=net0 \
         -netdev user,id=net0,hostfwd=tcp::5555-:22 \
         -smp 4 -m 4096 \
-        $QEMU_DISKS \
+        "${QEMU_DISKS_ARRAY[@]}" \
         > qemu_output.log 2>&1 &
     
     QEMU_PID=$!
@@ -288,7 +288,7 @@ boot_proxmox_with_port_forwarding() {
         fi
         echo -n "."
         sleep 5
-        if [ $i -eq 60 ]; then
+        if [ "$i" -eq 60 ]; then
             echo -e "${CLR_RED}SSH is not available after 5 minutes. Check the system manually.${CLR_RESET}"
             return 1
         fi
@@ -363,7 +363,7 @@ reboot_to_main_os() {
     echo -e "${CLR_YELLOW}After rebooting, you will be able to access your Proxmox at https://${MAIN_IPV4_CIDR%/*}:8006${CLR_RESET}"
     
     #ask user to reboot the system
-    read -e -p "Do you want to reboot the system? (y/n): " -i "y" REBOOT
+    read -er -p "Do you want to reboot the system? (y/n): " -i "y" REBOOT
     if [[ "$REBOOT" == "y" ]]; then
         echo -e "${CLR_YELLOW}Rebooting the system...${CLR_RESET}"
         reboot

@@ -19,8 +19,69 @@ fi
 
 echo -e "${CLR_GREEN}Starting Proxmox auto-installation...${CLR_RESET}"
 
+# Function to detect available disks
+detect_disks() {
+    echo -e "${CLR_BLUE}Detecting available disks...${CLR_RESET}"
+    
+    # Get all NVMe and SATA disks, excluding partitions
+    mapfile -t AVAILABLE_DISKS < <(lsblk -nd -o NAME | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z]+)$' | sort)
+    
+    if [ ${#AVAILABLE_DISKS[@]} -eq 0 ]; then
+        echo -e "${CLR_RED}No suitable disks found!${CLR_RESET}"
+        exit 1
+    fi
+    
+    echo -e "${CLR_YELLOW}Available disks:${CLR_RESET}"
+    for disk in "${AVAILABLE_DISKS[@]}"; do
+        SIZE=$(lsblk -nd -o SIZE /dev/$disk)
+        echo "  /dev/$disk ($SIZE)"
+    done
+    
+    # Configure disk setup based on number of disks
+    DISK_COUNT=${#AVAILABLE_DISKS[@]}
+    
+    if [ $DISK_COUNT -eq 1 ]; then
+        DISK_SETUP="single"
+        DISK_LIST="[\"/dev/${AVAILABLE_DISKS[0]}\"]"
+        echo -e "${CLR_YELLOW}Single disk detected: /dev/${AVAILABLE_DISKS[0]} - will use ZFS single disk${CLR_RESET}"
+    elif [ $((DISK_COUNT % 2)) -eq 0 ]; then
+        DISK_SETUP="raid1_multiple"
+        # Create pairs for RAID1 mirrors
+        DISK_LIST="["
+        for ((i=0; i<DISK_COUNT; i+=2)); do
+            if [ $i -gt 0 ]; then
+                DISK_LIST+=", "
+            fi
+            DISK_LIST+="\"/dev/${AVAILABLE_DISKS[i]}\", \"/dev/${AVAILABLE_DISKS[i+1]}\""
+        done
+        DISK_LIST+="]"
+        echo -e "${CLR_YELLOW}Even number of disks detected ($DISK_COUNT) - will create $((DISK_COUNT/2)) RAID1 mirror(s)${CLR_RESET}"
+    else
+        # Odd number of disks - use all but the last one for RAID1 pairs, last one as single
+        DISK_SETUP="raid1_plus_single"
+        PAIR_COUNT=$((DISK_COUNT-1))
+        DISK_LIST="["
+        for ((i=0; i<PAIR_COUNT; i+=2)); do
+            if [ $i -gt 0 ]; then
+                DISK_LIST+=", "
+            fi
+            DISK_LIST+="\"/dev/${AVAILABLE_DISKS[i]}\", \"/dev/${AVAILABLE_DISKS[i+1]}\""
+        done
+        DISK_LIST+=", \"/dev/${AVAILABLE_DISKS[-1]}\"]"
+        echo -e "${CLR_YELLOW}Odd number of disks detected ($DISK_COUNT) - will create $((PAIR_COUNT/2)) RAID1 mirror(s) and 1 single disk${CLR_RESET}"
+    fi
+    
+    QEMU_DISKS=""
+    for disk in "${AVAILABLE_DISKS[@]}"; do
+        QEMU_DISKS+=" -drive file=/dev/$disk,format=raw,media=disk,if=virtio"
+    done
+}
+
 # Function to get user input
 get_system_inputs() {
+    # Detect disks first
+    detect_disks
+    
     # Get default interface name and available alternative names first
     DEFAULT_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
     if [ -z "$DEFAULT_INTERFACE" ]; then
@@ -90,6 +151,23 @@ get_system_inputs() {
     echo ""
     echo "Private subnet: $PRIVATE_SUBNET"
     echo "First IP in subnet (CIDR): $PRIVATE_IP_CIDR"
+    
+    # Display final configuration summary
+    echo ""
+    echo -e "${CLR_GREEN}=== CONFIGURATION SUMMARY ===${CLR_RESET}"
+    echo -e "${CLR_YELLOW}Network:${CLR_RESET}"
+    echo "  Interface: $INTERFACE_NAME"
+    echo "  Main IP: $MAIN_IPV4_CIDR"
+    echo "  Gateway: $MAIN_IPV4_GW"
+    echo "  IPv6: $IPV6_CIDR"
+    echo "  Hostname: $HOSTNAME"
+    echo "  FQDN: $FQDN"
+    echo ""
+    echo -e "${CLR_YELLOW}Disk Configuration:${CLR_RESET}"
+    echo "  Disk Count: $DISK_COUNT"
+    echo "  Setup Type: $DISK_SETUP"
+    echo "  Disks: $DISK_LIST"
+    echo ""
 }
 
 
@@ -102,32 +180,17 @@ prepare_packages() {
     echo -e "${CLR_GREEN}Packages installed.${CLR_RESET}"
 }
 
-# Fetch latest Proxmox VE ISO
-get_latest_proxmox_ve_iso() {
-    local base_url="https://enterprise.proxmox.com/iso/"
-    local latest_iso=$(curl -s "$base_url" | grep -oP 'proxmox-ve_[0-9]+\.[0-9]+-[0-9]+\.iso' | sort -V | tail -n1)
-
-    if [[ -n "$latest_iso" ]]; then
-        echo "${base_url}${latest_iso}"
-    else
-        echo "No Proxmox VE ISO found." >&2
-        return 1
-    fi
-}
-
 download_proxmox_iso() {
-    echo -e "${CLR_BLUE}Downloading Proxmox ISO...${CLR_RESET}"
-    PROXMOX_ISO_URL=$(get_latest_proxmox_ve_iso)
-    if [[ -z "$PROXMOX_ISO_URL" ]]; then
-        echo -e "${CLR_RED}Failed to retrieve Proxmox ISO URL! Exiting.${CLR_RESET}"
-        exit 1
-    fi
+    echo -e "${CLR_BLUE}Downloading Proxmox ISO from Hetzner mirror...${CLR_RESET}"
+    PROXMOX_ISO_URL="https://hetzner:download@download.hetzner.com/bootimages/iso/proxmox-ve_8.3-1.iso"
     wget -O pve.iso "$PROXMOX_ISO_URL"
     echo -e "${CLR_GREEN}Proxmox ISO downloaded.${CLR_RESET}"
 }
 
 make_answer_toml() {
     echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
+    
+    # Create the answer.toml with dynamic disk configuration
     cat <<EOF > answer.toml
 [global]
     keyboard = "en-us"
@@ -143,11 +206,22 @@ make_answer_toml() {
 
 [disk-setup]
     filesystem = "zfs"
-    zfs.raid = "raid1"
-    disk_list = ["/dev/vda", "/dev/vdb"]
-
 EOF
-    echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
+
+    # Add ZFS RAID configuration based on disk setup
+    if [ "$DISK_SETUP" = "single" ]; then
+        cat <<EOF >> answer.toml
+    disk_list = $DISK_LIST
+EOF
+    else
+        cat <<EOF >> answer.toml
+    zfs.raid = "raid1"
+    disk_list = $DISK_LIST
+EOF
+    fi
+
+    echo "" >> answer.toml
+    echo -e "${CLR_GREEN}answer.toml created with $DISK_COUNT disk(s).${CLR_RESET}"
 }
 
 make_autoinstall_iso() {
@@ -179,8 +253,7 @@ install_proxmox() {
         -enable-kvm $UEFI_OPTS \
         -cpu host -smp 4 -m 4096 \
         -boot d -cdrom ./pve-autoinstall.iso \
-        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-        -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio -no-reboot -display none > /dev/null 2>&1
+        $QEMU_DISKS -no-reboot -display none > /dev/null 2>&1
 }
 
 # Function to boot the installed Proxmox via QEMU with port forwarding
@@ -200,8 +273,7 @@ boot_proxmox_with_port_forwarding() {
         -cpu host -device e1000,netdev=net0 \
         -netdev user,id=net0,hostfwd=tcp::5555-:22 \
         -smp 4 -m 4096 \
-        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-        -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio \
+        $QEMU_DISKS \
         > qemu_output.log 2>&1 &
     
     QEMU_PID=$!

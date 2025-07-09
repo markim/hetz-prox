@@ -24,55 +24,70 @@ detect_disks() {
     echo -e "${CLR_BLUE}Detecting available disks...${CLR_RESET}"
     
     # Get all NVMe and SATA disks, excluding partitions
-    mapfile -t AVAILABLE_DISKS < <(lsblk -nd -o NAME | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z]+)$' | sort)
+    mapfile -t ALL_DISKS < <(lsblk -nd -o NAME | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z]+)$' | sort)
     
-    if [ ${#AVAILABLE_DISKS[@]} -eq 0 ]; then
+    if [ ${#ALL_DISKS[@]} -eq 0 ]; then
         echo -e "${CLR_RED}No suitable disks found!${CLR_RESET}"
         exit 1
     fi
     
     echo -e "${CLR_YELLOW}Available disks:${CLR_RESET}"
-    for disk in "${AVAILABLE_DISKS[@]}"; do
-        SIZE=$(lsblk -nd -o SIZE /dev/"$disk")
-        echo "  /dev/$disk ($SIZE)"
+    
+    # Create array to store disk info (name:size_in_bytes)
+    declare -a DISK_INFO=()
+    for disk in "${ALL_DISKS[@]}"; do
+        SIZE_HUMAN=$(lsblk -nd -o SIZE /dev/"$disk")
+        SIZE_BYTES=$(lsblk -nd -o SIZE -b /dev/"$disk")
+        echo "  /dev/$disk ($SIZE_HUMAN)"
+        DISK_INFO+=("$disk:$SIZE_BYTES")
     done
     
-    # Configure disk setup based on number of disks
-    DISK_COUNT=${#AVAILABLE_DISKS[@]}
+    TOTAL_DISK_COUNT=${#ALL_DISKS[@]}
     
-    if [ "$DISK_COUNT" -eq 1 ]; then
+    if [ "$TOTAL_DISK_COUNT" -eq 1 ]; then
+        echo -e "${CLR_YELLOW}Only one disk available - will use single disk ZFS${CLR_RESET}"
         DISK_SETUP="single"
-        DISK_LIST="[\"/dev/${AVAILABLE_DISKS[0]}\"]"
-        echo -e "${CLR_YELLOW}Single disk detected: /dev/${AVAILABLE_DISKS[0]} - will use ZFS single disk${CLR_RESET}"
-    elif [ $((DISK_COUNT % 2)) -eq 0 ]; then
-        DISK_SETUP="raid1_multiple"
-        # Create pairs for RAID1 mirrors
-        DISK_LIST="["
-        for ((i=0; i<DISK_COUNT; i+=2)); do
-            if [ $i -gt 0 ]; then
-                DISK_LIST+=", "
-            fi
-            DISK_LIST+="\"/dev/${AVAILABLE_DISKS[i]}\", \"/dev/${AVAILABLE_DISKS[i+1]}\""
-        done
-        DISK_LIST+="]"
-        echo -e "${CLR_YELLOW}Even number of disks detected ($DISK_COUNT) - will create $((DISK_COUNT/2)) RAID1 mirror(s)${CLR_RESET}"
+        SYSTEM_DISKS=("${ALL_DISKS[0]}")
+        DISK_LIST="[\"/dev/${ALL_DISKS[0]}\"]"
+        REMAINING_DISKS=()
     else
-        # Odd number of disks - use all but the last one for RAID1 pairs, last one as single
-        DISK_SETUP="raid1_plus_single"
-        PAIR_COUNT=$((DISK_COUNT-1))
-        DISK_LIST="["
-        for ((i=0; i<PAIR_COUNT; i+=2)); do
-            if [ $i -gt 0 ]; then
-                DISK_LIST+=", "
+        echo -e "${CLR_BLUE}Finding smallest pair of disks for RAID1 system disk...${CLR_RESET}"
+        
+        # Sort disks by size (ascending)
+        mapfile -t DISK_INFO_SORTED < <(printf '%s\n' "${DISK_INFO[@]}" | sort -t: -k2 -n)
+        
+        # Get the two smallest disks for RAID1
+        SMALLEST_DISK1=$(echo "${DISK_INFO_SORTED[0]}" | cut -d: -f1)
+        SMALLEST_DISK2=$(echo "${DISK_INFO_SORTED[1]}" | cut -d: -f1)
+        
+        DISK_SETUP="raid1_system_only"
+        SYSTEM_DISKS=("$SMALLEST_DISK1" "$SMALLEST_DISK2")
+        DISK_LIST="[\"/dev/$SMALLEST_DISK1\", \"/dev/$SMALLEST_DISK2\"]"
+        
+        # Get remaining disks
+        REMAINING_DISKS=()
+        for disk in "${ALL_DISKS[@]}"; do
+            if [[ "$disk" != "$SMALLEST_DISK1" && "$disk" != "$SMALLEST_DISK2" ]]; then
+                REMAINING_DISKS+=("$disk")
             fi
-            DISK_LIST+="\"/dev/${AVAILABLE_DISKS[i]}\", \"/dev/${AVAILABLE_DISKS[i+1]}\""
         done
-        DISK_LIST+=", \"/dev/${AVAILABLE_DISKS[-1]}\"]"
-        echo -e "${CLR_YELLOW}Odd number of disks detected ($DISK_COUNT) - will create $((PAIR_COUNT/2)) RAID1 mirror(s) and 1 single disk${CLR_RESET}"
+        
+        SIZE1_HUMAN=$(lsblk -nd -o SIZE /dev/"$SMALLEST_DISK1")
+        SIZE2_HUMAN=$(lsblk -nd -o SIZE /dev/"$SMALLEST_DISK2")
+        echo -e "${CLR_YELLOW}Selected smallest disks for RAID1 system: /dev/$SMALLEST_DISK1 ($SIZE1_HUMAN) + /dev/$SMALLEST_DISK2 ($SIZE2_HUMAN)${CLR_RESET}"
+        
+        if [ ${#REMAINING_DISKS[@]} -gt 0 ]; then
+            echo -e "${CLR_YELLOW}Remaining disks (will be left unformatted for manual setup):${CLR_RESET}"
+            for disk in "${REMAINING_DISKS[@]}"; do
+                SIZE_HUMAN=$(lsblk -nd -o SIZE /dev/"$disk")
+                echo "  /dev/$disk ($SIZE_HUMAN)"
+            done
+        fi
     fi
     
+    # Only include system disks in QEMU
     QEMU_DISKS_ARRAY=()
-    for disk in "${AVAILABLE_DISKS[@]}"; do
+    for disk in "${SYSTEM_DISKS[@]}"; do
         QEMU_DISKS_ARRAY+=("-drive" "file=/dev/$disk,format=raw,media=disk,if=virtio")
     done
 }
@@ -164,9 +179,12 @@ get_system_inputs() {
     echo "  FQDN: $FQDN"
     echo ""
     echo -e "${CLR_YELLOW}Disk Configuration:${CLR_RESET}"
-    echo "  Disk Count: $DISK_COUNT"
-    echo "  Setup Type: $DISK_SETUP"
-    echo "  Disks: $DISK_LIST"
+    echo "  Total Disks: $TOTAL_DISK_COUNT"
+    echo "  System Disk Setup: $DISK_SETUP"
+    echo "  System Disks: $DISK_LIST"
+    if [ ${#REMAINING_DISKS[@]} -gt 0 ]; then
+        echo "  Remaining Disks: ${REMAINING_DISKS[*]} (unformatted)"
+    fi
     echo ""
 }
 
@@ -221,7 +239,7 @@ EOF
     fi
 
     echo "" >> answer.toml
-    echo -e "${CLR_GREEN}answer.toml created with $DISK_COUNT disk(s).${CLR_RESET}"
+    echo -e "${CLR_GREEN}answer.toml created with ${#SYSTEM_DISKS[@]} system disk(s).${CLR_RESET}"
 }
 
 make_autoinstall_iso() {
@@ -361,6 +379,17 @@ configure_proxmox_via_ssh() {
 reboot_to_main_os() {
     echo -e "${CLR_GREEN}Installation complete!${CLR_RESET}"
     echo -e "${CLR_YELLOW}After rebooting, you will be able to access your Proxmox at https://${MAIN_IPV4_CIDR%/*}:8006${CLR_RESET}"
+    
+    if [ ${#REMAINING_DISKS[@]} -gt 0 ]; then
+        echo ""
+        echo -e "${CLR_BLUE}=== REMAINING DISKS ===${CLR_RESET}"
+        echo -e "${CLR_YELLOW}The following disks were left unformatted and are available for manual ZFS setup:${CLR_RESET}"
+        for disk in "${REMAINING_DISKS[@]}"; do
+            SIZE_HUMAN=$(lsblk -nd -o SIZE /dev/"$disk")
+            echo "  /dev/$disk ($SIZE_HUMAN)"
+        done
+        echo -e "${CLR_YELLOW}You can set these up manually after Proxmox is running.${CLR_RESET}"
+    fi
     
     #ask user to reboot the system
     read -er -p "Do you want to reboot the system? (y/n): " -i "y" REBOOT

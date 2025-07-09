@@ -88,7 +88,27 @@ detect_disks() {
     # Only include system disks in QEMU
     QEMU_DISKS_ARRAY=()
     for disk in "${SYSTEM_DISKS[@]}"; do
-        QEMU_DISKS_ARRAY+=("-drive" "file=/dev/$disk,format=raw,media=disk,if=virtio")
+        # Ensure we have the full path with /dev/ prefix
+        if [[ "$disk" =~ ^/dev/ ]]; then
+            DISK_PATH="$disk"
+        else
+            DISK_PATH="/dev/$disk"
+        fi
+        
+        # Validate disk exists and is accessible
+        if [ ! -b "$DISK_PATH" ]; then
+            echo -e "${CLR_RED}Error: Disk $DISK_PATH does not exist or is not a block device!${CLR_RESET}"
+            exit 1
+        fi
+        
+        # Check if disk is accessible
+        if ! dd if="$DISK_PATH" of=/dev/null bs=512 count=1 >/dev/null 2>&1; then
+            echo -e "${CLR_RED}Error: Cannot read from disk $DISK_PATH!${CLR_RESET}"
+            exit 1
+        fi
+        
+        QEMU_DISKS_ARRAY+=("-drive" "file=$DISK_PATH,format=raw,media=disk,if=virtio")
+        echo -e "${CLR_GREEN}Added disk: $DISK_PATH${CLR_RESET}"
     done
     
     # Validate we have disks configured
@@ -309,6 +329,8 @@ install_proxmox() {
     
     # Debug: Show the command we're about to run
     echo -e "${CLR_BLUE}Debug: Running QEMU with system disks: ${SYSTEM_DISKS[*]}${CLR_RESET}"
+    echo -e "${CLR_BLUE}Debug: Full QEMU command:${CLR_RESET}"
+    echo "qemu-system-x86_64 $KVM_OPTS \"$UEFI_OPTS\" -cpu host -smp 4 -m 4096 -boot d -cdrom ./pve-autoinstall.iso ${QEMU_DISKS_ARRAY[*]} -no-reboot -display none"
     
     # Run QEMU and capture exit code
     set +e  # Temporarily disable exit on error

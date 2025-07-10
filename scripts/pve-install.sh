@@ -19,112 +19,8 @@ fi
 
 echo -e "${CLR_GREEN}Starting Proxmox auto-installation...${CLR_RESET}"
 
-# Function to detect available disks
-detect_disks() {
-    echo -e "${CLR_BLUE}Detecting available disks...${CLR_RESET}"
-    
-    # Get all NVMe and SATA disks, excluding partitions
-    mapfile -t ALL_DISKS < <(lsblk -nd -o NAME | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z]+)$' | sort)
-    
-    if [ ${#ALL_DISKS[@]} -eq 0 ]; then
-        echo -e "${CLR_RED}No suitable disks found!${CLR_RESET}"
-        exit 1
-    fi
-    
-    echo -e "${CLR_YELLOW}Available disks:${CLR_RESET}"
-    
-    # Create array to store disk info (name:size_in_bytes)
-    declare -a DISK_INFO=()
-    for disk in "${ALL_DISKS[@]}"; do
-        SIZE_HUMAN=$(lsblk -nd -o SIZE /dev/"$disk")
-        SIZE_BYTES=$(lsblk -nd -o SIZE -b /dev/"$disk")
-        echo "  /dev/$disk ($SIZE_HUMAN)"
-        DISK_INFO+=("$disk:$SIZE_BYTES")
-    done
-    
-    TOTAL_DISK_COUNT=${#ALL_DISKS[@]}
-    
-    if [ "$TOTAL_DISK_COUNT" -eq 1 ]; then
-        echo -e "${CLR_YELLOW}Only one disk available - will use single disk ZFS${CLR_RESET}"
-        DISK_SETUP="single"
-        SYSTEM_DISKS=("${ALL_DISKS[0]}")
-        DISK_LIST="[\"/dev/${ALL_DISKS[0]}\"]"
-        REMAINING_DISKS=()
-    else
-        echo -e "${CLR_BLUE}Finding smallest pair of disks for RAID1 system disk...${CLR_RESET}"
-        
-        # Sort disks by size (ascending)
-        mapfile -t DISK_INFO_SORTED < <(printf '%s\n' "${DISK_INFO[@]}" | sort -t: -k2 -n)
-        
-        # Get the two smallest disks for RAID1
-        SMALLEST_DISK1=$(echo "${DISK_INFO_SORTED[0]}" | cut -d: -f1)
-        SMALLEST_DISK2=$(echo "${DISK_INFO_SORTED[1]}" | cut -d: -f1)
-        
-        DISK_SETUP="raid1_system_only"
-        SYSTEM_DISKS=("$SMALLEST_DISK1" "$SMALLEST_DISK2")
-        DISK_LIST="[\"/dev/$SMALLEST_DISK1\", \"/dev/$SMALLEST_DISK2\"]"
-        
-        # Get remaining disks
-        REMAINING_DISKS=()
-        for disk in "${ALL_DISKS[@]}"; do
-            if [[ "$disk" != "$SMALLEST_DISK1" && "$disk" != "$SMALLEST_DISK2" ]]; then
-                REMAINING_DISKS+=("$disk")
-            fi
-        done
-        
-        SIZE1_HUMAN=$(lsblk -nd -o SIZE /dev/"$SMALLEST_DISK1")
-        SIZE2_HUMAN=$(lsblk -nd -o SIZE /dev/"$SMALLEST_DISK2")
-        echo -e "${CLR_YELLOW}Selected smallest disks for RAID1 system: /dev/$SMALLEST_DISK1 ($SIZE1_HUMAN) + /dev/$SMALLEST_DISK2 ($SIZE2_HUMAN)${CLR_RESET}"
-        
-        if [ ${#REMAINING_DISKS[@]} -gt 0 ]; then
-            echo -e "${CLR_YELLOW}Remaining disks (will be left unformatted for manual setup):${CLR_RESET}"
-            for disk in "${REMAINING_DISKS[@]}"; do
-                SIZE_HUMAN=$(lsblk -nd -o SIZE /dev/"$disk")
-                echo "  /dev/$disk ($SIZE_HUMAN)"
-            done
-        fi
-    fi
-    
-    # Only include system disks in QEMU
-    QEMU_DISKS_ARRAY=()
-    for disk in "${SYSTEM_DISKS[@]}"; do
-        # Ensure we have the full path with /dev/ prefix
-        if [[ "$disk" =~ ^/dev/ ]]; then
-            DISK_PATH="$disk"
-        else
-            DISK_PATH="/dev/$disk"
-        fi
-        
-        # Validate disk exists and is accessible
-        if [ ! -b "$DISK_PATH" ]; then
-            echo -e "${CLR_RED}Error: Disk $DISK_PATH does not exist or is not a block device!${CLR_RESET}"
-            exit 1
-        fi
-        
-        # Check if disk is accessible
-        if ! dd if="$DISK_PATH" of=/dev/null bs=512 count=1 >/dev/null 2>&1; then
-            echo -e "${CLR_RED}Error: Cannot read from disk $DISK_PATH!${CLR_RESET}"
-            exit 1
-        fi
-        
-        QEMU_DISKS_ARRAY+=("-drive" "file=$DISK_PATH,format=raw,media=disk,if=virtio")
-        echo -e "${CLR_GREEN}Added disk: $DISK_PATH${CLR_RESET}"
-    done
-    
-    # Validate we have disks configured
-    if [ ${#QEMU_DISKS_ARRAY[@]} -eq 0 ]; then
-        echo -e "${CLR_RED}Error: No QEMU disks configured!${CLR_RESET}"
-        exit 1
-    fi
-    
-    echo -e "${CLR_BLUE}Debug: QEMU disk arguments: ${QEMU_DISKS_ARRAY[*]}${CLR_RESET}"
-}
-
 # Function to get user input
 get_system_inputs() {
-    # Detect disks first
-    detect_disks
-    
     # Get default interface name and available alternative names first
     DEFAULT_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
     if [ -z "$DEFAULT_INTERFACE" ]; then
@@ -140,7 +36,7 @@ get_system_inputs() {
     fi
     
     # Prompt user for interface name
-    read -er -p "Interface name (options are: ${AVAILABLE_ALTNAMES}) : " -i "$INTERFACE_NAME" INTERFACE_NAME
+    read -e -p "Interface name (options are: ${AVAILABLE_ALTNAMES}) : " -i "$INTERFACE_NAME" INTERFACE_NAME
     
     # Now get network information based on the selected interface
     MAIN_IPV4_CIDR=$(ip address show "$INTERFACE_NAME" | grep global | grep "inet " | xargs | cut -d" " -f2)
@@ -168,12 +64,12 @@ get_system_inputs() {
     echo "IPv6: $MAIN_IPV6"
     
     # Get user input for other configuration
-    read -er -p "Enter your hostname : " -i "proxmox" HOSTNAME
-    read -er -p "Enter your FQDN name : " -i "proxmox.e.com" FQDN
-    read -er -p "Enter your timezone : " -i "America/Phoenix" TIMEZONE
-    read -er -p "Enter your email address: " -i "a@e.com" EMAIL
-    read -er -p "Enter your private subnet : " -i "192.168.1.10/24" PRIVATE_SUBNET
-    read -er -p "Enter your System New root password: " NEW_ROOT_PASSWORD
+    read -e -p "Enter your hostname : " -i "proxmox-example" HOSTNAME
+    read -e -p "Enter your FQDN name : " -i "proxmox.example.com" FQDN
+    read -e -p "Enter your timezone : " -i "Europe/Istanbul" TIMEZONE
+    read -e -p "Enter your email address: " -i "admin@example.com" EMAIL
+    read -e -p "Enter your private subnet : " -i "192.168.26.0/24" PRIVATE_SUBNET
+    read -e -p "Enter your System New root password: " NEW_ROOT_PASSWORD
     
     # Get the network prefix (first three octets) from PRIVATE_SUBNET
     PRIVATE_CIDR=$(echo "$PRIVATE_SUBNET" | cut -d'/' -f1 | rev | cut -d'.' -f2- | rev)
@@ -188,32 +84,12 @@ get_system_inputs() {
     while [[ -z "$NEW_ROOT_PASSWORD" ]]; do
         # Print message in a new line
         echo ""
-        read -er -p "Enter your System New root password: " NEW_ROOT_PASSWORD
+        read -e -p "Enter your System New root password: " NEW_ROOT_PASSWORD
     done
 
     echo ""
     echo "Private subnet: $PRIVATE_SUBNET"
     echo "First IP in subnet (CIDR): $PRIVATE_IP_CIDR"
-    
-    # Display final configuration summary
-    echo ""
-    echo -e "${CLR_GREEN}=== CONFIGURATION SUMMARY ===${CLR_RESET}"
-    echo -e "${CLR_YELLOW}Network:${CLR_RESET}"
-    echo "  Interface: $INTERFACE_NAME"
-    echo "  Main IP: $MAIN_IPV4_CIDR"
-    echo "  Gateway: $MAIN_IPV4_GW"
-    echo "  IPv6: $IPV6_CIDR"
-    echo "  Hostname: $HOSTNAME"
-    echo "  FQDN: $FQDN"
-    echo ""
-    echo -e "${CLR_YELLOW}Disk Configuration:${CLR_RESET}"
-    echo "  Total Disks: $TOTAL_DISK_COUNT"
-    echo "  System Disk Setup: $DISK_SETUP"
-    echo "  System Disks: $DISK_LIST"
-    if [ ${#REMAINING_DISKS[@]} -gt 0 ]; then
-        echo "  Remaining Disks: ${REMAINING_DISKS[*]} (unformatted)"
-    fi
-    echo ""
 }
 
 
@@ -226,17 +102,32 @@ prepare_packages() {
     echo -e "${CLR_GREEN}Packages installed.${CLR_RESET}"
 }
 
+# Fetch latest Proxmox VE ISO
+get_latest_proxmox_ve_iso() {
+    local base_url="https://enterprise.proxmox.com/iso/"
+    local latest_iso=$(curl -s "$base_url" | grep -oP 'proxmox-ve_[0-9]+\.[0-9]+-[0-9]+\.iso' | sort -V | tail -n1)
+
+    if [[ -n "$latest_iso" ]]; then
+        echo "${base_url}${latest_iso}"
+    else
+        echo "No Proxmox VE ISO found." >&2
+        return 1
+    fi
+}
+
 download_proxmox_iso() {
-    echo -e "${CLR_BLUE}Downloading Proxmox ISO from Hetzner mirror...${CLR_RESET}"
-    PROXMOX_ISO_URL="https://hetzner:download@download.hetzner.com/bootimages/iso/proxmox-ve_8.3-1.iso"
+    echo -e "${CLR_BLUE}Downloading Proxmox ISO...${CLR_RESET}"
+    PROXMOX_ISO_URL=$(get_latest_proxmox_ve_iso)
+    if [[ -z "$PROXMOX_ISO_URL" ]]; then
+        echo -e "${CLR_RED}Failed to retrieve Proxmox ISO URL! Exiting.${CLR_RESET}"
+        exit 1
+    fi
     wget -O pve.iso "$PROXMOX_ISO_URL"
     echo -e "${CLR_GREEN}Proxmox ISO downloaded.${CLR_RESET}"
 }
 
 make_answer_toml() {
     echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
-    
-    # Create the answer.toml with dynamic disk configuration
     cat <<EOF > answer.toml
 [global]
     keyboard = "en-us"
@@ -252,44 +143,16 @@ make_answer_toml() {
 
 [disk-setup]
     filesystem = "zfs"
-EOF
-
-    # Add ZFS RAID configuration based on disk setup
-    if [ "$DISK_SETUP" = "single" ]; then
-        cat <<EOF >> answer.toml
-    disk_list = $DISK_LIST
-EOF
-    else
-        cat <<EOF >> answer.toml
     zfs.raid = "raid1"
-    disk_list = $DISK_LIST
-EOF
-    fi
+    disk_list = ["/dev/vda", "/dev/vdb"]
 
-    echo "" >> answer.toml
-    echo -e "${CLR_GREEN}answer.toml created with ${#SYSTEM_DISKS[@]} system disk(s).${CLR_RESET}"
+EOF
+    echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
 }
 
 make_autoinstall_iso() {
     echo -e "${CLR_BLUE}Making autoinstall.iso...${CLR_RESET}"
-    
-    if [ ! -f "pve.iso" ]; then
-        echo -e "${CLR_RED}Error: pve.iso not found!${CLR_RESET}"
-        exit 1
-    fi
-    
-    if [ ! -f "answer.toml" ]; then
-        echo -e "${CLR_RED}Error: answer.toml not found!${CLR_RESET}"
-        exit 1
-    fi
-    
     proxmox-auto-install-assistant prepare-iso pve.iso --fetch-from iso --answer-file answer.toml --output pve-autoinstall.iso
-    
-    if [ ! -f "pve-autoinstall.iso" ]; then
-        echo -e "${CLR_RED}Error: Failed to create pve-autoinstall.iso!${CLR_RESET}"
-        exit 1
-    fi
-    
     echo -e "${CLR_GREEN}pve-autoinstall.iso created.${CLR_RESET}"
 }
 
@@ -297,23 +160,9 @@ is_uefi_mode() {
   [ -d /sys/firmware/efi ]
 }
 
-# Check if KVM is available
-check_kvm() {
-    if [ ! -e /dev/kvm ]; then
-        echo -e "${CLR_YELLOW}Warning: KVM not available, using software emulation (will be slower)${CLR_RESET}"
-        KVM_OPTS=""
-    else
-        echo -e "${CLR_GREEN}KVM acceleration available${CLR_RESET}"
-        KVM_OPTS="-enable-kvm"
-    fi
-}
-
 # Install Proxmox via QEMU/VNC
 install_proxmox() {
     echo -e "${CLR_GREEN}Starting Proxmox VE installation...${CLR_RESET}"
-
-    # Check KVM availability
-    check_kvm
 
     if is_uefi_mode; then
         UEFI_OPTS="-bios /usr/share/ovmf/OVMF.fd"
@@ -326,39 +175,17 @@ install_proxmox() {
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
     echo -e "${CLR_RED}Do NOT do anything, just wait about 5-10 min!${CLR_RED}"
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
-    
-    # Debug: Show the command we're about to run
-    echo -e "${CLR_BLUE}Debug: Running QEMU with system disks: ${SYSTEM_DISKS[*]}${CLR_RESET}"
-    echo -e "${CLR_BLUE}Debug: Full QEMU command:${CLR_RESET}"
-    echo "qemu-system-x86_64 $KVM_OPTS \"$UEFI_OPTS\" -cpu host -smp 4 -m 4096 -boot d -cdrom ./pve-autoinstall.iso ${QEMU_DISKS_ARRAY[*]} -no-reboot -display none"
-    
-    # Run QEMU and capture exit code
-    set +e  # Temporarily disable exit on error
     qemu-system-x86_64 \
-        $KVM_OPTS "$UEFI_OPTS" \
+        -enable-kvm $UEFI_OPTS \
         -cpu host -smp 4 -m 4096 \
         -boot d -cdrom ./pve-autoinstall.iso \
-        "${QEMU_DISKS_ARRAY[@]}" -no-reboot -display none > qemu_install.log 2>&1
-    
-    QEMU_EXIT_CODE=$?
-    set -e  # Re-enable exit on error
-    
-    if [ $QEMU_EXIT_CODE -ne 0 ]; then
-        echo -e "${CLR_RED}QEMU installation failed with exit code: $QEMU_EXIT_CODE${CLR_RESET}"
-        echo -e "${CLR_YELLOW}QEMU output:${CLR_RESET}"
-        cat qemu_install.log
-        exit 1
-    fi
-    
-    echo -e "${CLR_GREEN}Proxmox installation completed successfully!${CLR_RESET}"
+        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
+        -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio -no-reboot -display none > /dev/null 2>&1
 }
 
 # Function to boot the installed Proxmox via QEMU with port forwarding
 boot_proxmox_with_port_forwarding() {
     echo -e "${CLR_GREEN}Booting installed Proxmox with SSH port forwarding...${CLR_RESET}"
-
-    # Check KVM availability
-    check_kvm
 
     if is_uefi_mode; then
         UEFI_OPTS="-bios /usr/share/ovmf/OVMF.fd"
@@ -369,11 +196,12 @@ boot_proxmox_with_port_forwarding() {
     fi
     # UEFI_OPTS=""
     # Start QEMU in background with port forwarding
-    nohup qemu-system-x86_64 $KVM_OPTS "$UEFI_OPTS" \
+    nohup qemu-system-x86_64 -enable-kvm $UEFI_OPTS \
         -cpu host -device e1000,netdev=net0 \
         -netdev user,id=net0,hostfwd=tcp::5555-:22 \
         -smp 4 -m 4096 \
-        "${QEMU_DISKS_ARRAY[@]}" \
+        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
+        -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio \
         > qemu_output.log 2>&1 &
     
     QEMU_PID=$!
@@ -388,7 +216,7 @@ boot_proxmox_with_port_forwarding() {
         fi
         echo -n "."
         sleep 5
-        if [ "$i" -eq 60 ]; then
+        if [ $i -eq 60 ]; then
             echo -e "${CLR_RED}SSH is not available after 5 minutes. Check the system manually.${CLR_RESET}"
             return 1
         fi
@@ -462,19 +290,8 @@ reboot_to_main_os() {
     echo -e "${CLR_GREEN}Installation complete!${CLR_RESET}"
     echo -e "${CLR_YELLOW}After rebooting, you will be able to access your Proxmox at https://${MAIN_IPV4_CIDR%/*}:8006${CLR_RESET}"
     
-    if [ ${#REMAINING_DISKS[@]} -gt 0 ]; then
-        echo ""
-        echo -e "${CLR_BLUE}=== REMAINING DISKS ===${CLR_RESET}"
-        echo -e "${CLR_YELLOW}The following disks were left unformatted and are available for manual ZFS setup:${CLR_RESET}"
-        for disk in "${REMAINING_DISKS[@]}"; do
-            SIZE_HUMAN=$(lsblk -nd -o SIZE /dev/"$disk")
-            echo "  /dev/$disk ($SIZE_HUMAN)"
-        done
-        echo -e "${CLR_YELLOW}You can set these up manually after Proxmox is running.${CLR_RESET}"
-    fi
-    
     #ask user to reboot the system
-    read -er -p "Do you want to reboot the system? (y/n): " -i "y" REBOOT
+    read -e -p "Do you want to reboot the system? (y/n): " -i "y" REBOOT
     if [[ "$REBOOT" == "y" ]]; then
         echo -e "${CLR_YELLOW}Rebooting the system...${CLR_RESET}"
         reboot

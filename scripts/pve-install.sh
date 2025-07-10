@@ -248,7 +248,7 @@ prepare_packages() {
     echo -e "${CLR_BLUE}Installing packages...${CLR_RESET}"
     echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" | tee /etc/apt/sources.list.d/pve.list
     curl -o /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
-    apt clean && apt update && apt install -yq proxmox-auto-install-assistant xorriso ovmf wget sshpass
+    apt clean && apt update && apt install -yq proxmox-auto-install-assistant xorriso ovmf wget sshpass mdadm gdisk util-linux
 
     echo -e "${CLR_GREEN}Packages installed.${CLR_RESET}"
 }
@@ -283,9 +283,10 @@ make_answer_toml() {
     
     # Build disk list for toml format using virtual drive names (/dev/vda, /dev/vdb, etc.)
     DISK_LIST_TOML=""
+    DRIVE_LETTERS=(a b c d e f g h i j k l m n o p q r s t u v w x y z)
     for i in "${!SELECTED_DRIVES[@]}"; do
         # Convert to virtual drive letters (vda, vdb, vdc, etc.)
-        VIRTUAL_DRIVE="/dev/vd$(printf "%c" $((97+i)))"
+        VIRTUAL_DRIVE="/dev/vd${DRIVE_LETTERS[$i]}"
         if [ $i -eq 0 ]; then
             DISK_LIST_TOML="\"$VIRTUAL_DRIVE\""
         else
@@ -346,9 +347,11 @@ build_qemu_drives() {
 # Function to show drive mapping for debugging
 show_drive_mapping() {
     echo -e "${CLR_YELLOW}Drive Mapping Summary:${CLR_RESET}"
+    echo -e "${CLR_YELLOW}Selected drives array has ${#SELECTED_DRIVES[@]} elements${CLR_RESET}"
+    DRIVE_LETTERS=(a b c d e f g h i j k l m n o p q r s t u v w x y z)
     for i in "${!SELECTED_DRIVES[@]}"; do
-        VIRTUAL_DRIVE="/dev/vd$(printf "%c" $((97+i)))"
-        echo -e "${CLR_YELLOW}  Physical: ${SELECTED_DRIVES[$i]} -> Virtual: $VIRTUAL_DRIVE${CLR_RESET}"
+        VIRTUAL_DRIVE="/dev/vd${DRIVE_LETTERS[$i]}"
+        echo -e "${CLR_YELLOW}  Index $i: Physical: ${SELECTED_DRIVES[$i]} -> Virtual: $VIRTUAL_DRIVE${CLR_RESET}"
     done
 }
 
@@ -378,11 +381,26 @@ install_proxmox() {
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
     echo -e "${CLR_RED}Do NOT do anything, just wait about 5-10 min!${CLR_RED}"
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
-    qemu-system-x86_64 \
+    
+    # Start QEMU installation with timeout
+    timeout 900 qemu-system-x86_64 \
         -enable-kvm $UEFI_OPTS \
         -cpu host -smp 4 -m 4096 \
         -boot d -cdrom ./pve-autoinstall.iso \
-        $DRIVE_ARGS -no-reboot -display none > /dev/null 2>&1
+        $DRIVE_ARGS -no-reboot -display none > qemu_install.log 2>&1
+    
+    INSTALL_EXIT_CODE=$?
+    if [ $INSTALL_EXIT_CODE -eq 124 ]; then
+        echo -e "${CLR_RED}Installation timed out after 15 minutes!${CLR_RESET}"
+        echo -e "${CLR_YELLOW}Check qemu_install.log for details${CLR_RESET}"
+        exit 1
+    elif [ $INSTALL_EXIT_CODE -ne 0 ]; then
+        echo -e "${CLR_RED}Installation failed with exit code $INSTALL_EXIT_CODE${CLR_RESET}"
+        echo -e "${CLR_YELLOW}Check qemu_install.log for details${CLR_RESET}"
+        exit 1
+    fi
+    
+    echo -e "${CLR_GREEN}Installation completed successfully!${CLR_RESET}"
 }
 
 # Function to boot the installed Proxmox via QEMU with port forwarding
@@ -507,10 +525,58 @@ reboot_to_main_os() {
 
 
 
+# Function to clean drives before installation
+clean_drives() {
+    echo -e "${CLR_YELLOW}Cleaning selected drives...${CLR_RESET}"
+    
+    for drive in "${SELECTED_DRIVES[@]}"; do
+        echo -e "${CLR_YELLOW}Cleaning $drive...${CLR_RESET}"
+        
+        # Stop any RAID arrays using this drive
+        if [ -f /proc/mdstat ] && grep -q "$(basename "$drive")" /proc/mdstat; then
+            echo -e "${CLR_YELLOW}Stopping RAID arrays on $drive...${CLR_RESET}"
+            # Find all RAID devices using this drive
+            for md_device in /dev/md[0-9]*; do
+                [ -e "$md_device" ] || continue
+                if mdadm --detail "$md_device" 2>/dev/null | grep -q "$(basename "$drive")"; then
+                    echo -e "${CLR_YELLOW}Stopping RAID device $md_device...${CLR_RESET}"
+                    mdadm --stop "$md_device" 2>/dev/null || true
+                fi
+            done
+        fi
+        
+        # Remove any LVM physical volumes
+        if command -v pvremove &> /dev/null; then
+            pvremove -ff -y "$drive"* 2>/dev/null || true
+        fi
+        
+        # Wipe filesystem signatures and partition table
+        wipefs -af "$drive" 2>/dev/null || true
+        
+        # Zero out the beginning and end of the drive
+        dd if=/dev/zero of="$drive" bs=1M count=10 2>/dev/null || true
+        dd if=/dev/zero of="$drive" bs=1M seek=$(($(blockdev --getsz "$drive") / 2048 - 10)) count=10 2>/dev/null || true
+        
+        # Remove any existing partitions
+        sgdisk --zap-all "$drive" 2>/dev/null || true
+        
+        echo -e "${CLR_GREEN}$drive cleaned successfully.${CLR_RESET}"
+    done
+    
+    # Update kernel partition table
+    partprobe 2>/dev/null || true
+    
+    # Wait a moment for changes to take effect
+    sleep 3
+    
+    echo -e "${CLR_GREEN}All selected drives cleaned successfully.${CLR_RESET}"
+}
+
 # Main execution flow
 get_system_inputs
 prepare_packages
 download_proxmox_iso
+clean_drives
 make_answer_toml
 make_autoinstall_iso
 install_proxmox

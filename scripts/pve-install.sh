@@ -56,16 +56,24 @@ get_zfs_config() {
             echo "single"
             ;;
         2)
-            echo "mirror"
+            echo "raid1"
             ;;
-        3|4|5)
-            echo "raidz1"
+        3)
+            echo "raidz-1"
+            ;;
+        4)
+            # For 4 drives, we could use RAID10 or RAIDZ-1
+            # RAID10 gives better performance but less usable space
+            echo "raid10"
+            ;;
+        5)
+            echo "raidz-1"
             ;;
         6|7|8|9)
-            echo "raidz2"
+            echo "raidz-2"
             ;;
         *)
-            echo "raidz3"
+            echo "raidz-3"
             ;;
     esac
 }
@@ -130,17 +138,20 @@ select_drives() {
         "single")
             echo -e "${CLR_YELLOW}Note: Single drive - no redundancy. Consider backup strategy.${CLR_RESET}"
             ;;
-        "mirror")
-            echo -e "${CLR_YELLOW}Note: Mirror (RAID1) - can survive 1 drive failure.${CLR_RESET}"
+        "raid1")
+            echo -e "${CLR_YELLOW}Note: RAID1 (Mirror) - can survive 1 drive failure.${CLR_RESET}"
             ;;
-        "raidz1")
-            echo -e "${CLR_YELLOW}Note: RAIDZ1 - can survive 1 drive failure, more space efficient than mirror.${CLR_RESET}"
+        "raid10")
+            echo -e "${CLR_YELLOW}Note: RAID10 - can survive multiple drive failures, excellent performance.${CLR_RESET}"
             ;;
-        "raidz2")
-            echo -e "${CLR_YELLOW}Note: RAIDZ2 - can survive 2 drive failures, recommended for 6+ drives.${CLR_RESET}"
+        "raidz-1")
+            echo -e "${CLR_YELLOW}Note: RAIDZ-1 - can survive 1 drive failure, more space efficient than mirror.${CLR_RESET}"
             ;;
-        "raidz3")
-            echo -e "${CLR_YELLOW}Note: RAIDZ3 - can survive 3 drive failures, best for large arrays.${CLR_RESET}"
+        "raidz-2")
+            echo -e "${CLR_YELLOW}Note: RAIDZ-2 - can survive 2 drive failures, recommended for 6+ drives.${CLR_RESET}"
+            ;;
+        "raidz-3")
+            echo -e "${CLR_YELLOW}Note: RAIDZ-3 - can survive 3 drive failures, best for large arrays.${CLR_RESET}"
             ;;
     esac
     

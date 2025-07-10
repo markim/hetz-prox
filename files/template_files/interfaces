@@ -20,7 +20,7 @@ iface {{INTERFACE_NAME}} inet manual
 
 auto vmbr0
 iface vmbr0 inet static
-    address {{MAIN_IPV4_CIDR}}
+    address {{MAIN_IPV4}}/32
     gateway {{MAIN_IPV4_GW}}
     bridge-ports {{INTERFACE_NAME}}
     bridge-stp off

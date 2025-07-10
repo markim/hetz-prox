@@ -281,13 +281,15 @@ download_proxmox_iso() {
 make_answer_toml() {
     echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
     
-    # Build disk list for toml format
+    # Build disk list for toml format using virtual drive names (/dev/vda, /dev/vdb, etc.)
     DISK_LIST_TOML=""
     for i in "${!SELECTED_DRIVES[@]}"; do
+        # Convert to virtual drive letters (vda, vdb, vdc, etc.)
+        VIRTUAL_DRIVE="/dev/vd$(printf "%c" $((97+i)))"
         if [ $i -eq 0 ]; then
-            DISK_LIST_TOML="\"${SELECTED_DRIVES[$i]}\""
+            DISK_LIST_TOML="\"$VIRTUAL_DRIVE\""
         else
-            DISK_LIST_TOML="${DISK_LIST_TOML}, \"${SELECTED_DRIVES[$i]}\""
+            DISK_LIST_TOML="${DISK_LIST_TOML}, \"$VIRTUAL_DRIVE\""
         fi
     done
     
@@ -322,6 +324,7 @@ $RAID_CONFIG
 
 EOF
     echo -e "${CLR_GREEN}answer.toml created with ${#SELECTED_DRIVES[@]} drive(s) using $FILESYSTEM${CLR_RESET}"
+    echo -e "${CLR_YELLOW}Virtual drives in answer.toml: $DISK_LIST_TOML${CLR_RESET}"
 }
 
 make_autoinstall_iso() {
@@ -333,10 +336,20 @@ make_autoinstall_iso() {
 # Function to build QEMU drive arguments
 build_qemu_drives() {
     local drive_args=""
-    for drive in "${SELECTED_DRIVES[@]}"; do
+    for i in "${!SELECTED_DRIVES[@]}"; do
+        drive="${SELECTED_DRIVES[$i]}"
         drive_args="$drive_args -drive file=$drive,format=raw,media=disk,if=virtio"
     done
     echo "$drive_args"
+}
+
+# Function to show drive mapping for debugging
+show_drive_mapping() {
+    echo -e "${CLR_YELLOW}Drive Mapping Summary:${CLR_RESET}"
+    for i in "${!SELECTED_DRIVES[@]}"; do
+        VIRTUAL_DRIVE="/dev/vd$(printf "%c" $((97+i)))"
+        echo -e "${CLR_YELLOW}  Physical: ${SELECTED_DRIVES[$i]} -> Virtual: $VIRTUAL_DRIVE${CLR_RESET}"
+    done
 }
 
 is_uefi_mode() {
@@ -346,6 +359,9 @@ is_uefi_mode() {
 # Install Proxmox via QEMU/VNC
 install_proxmox() {
     echo -e "${CLR_GREEN}Starting Proxmox VE installation...${CLR_RESET}"
+    
+    # Show drive mapping for debugging
+    show_drive_mapping
 
     if is_uefi_mode; then
         UEFI_OPTS="-bios /usr/share/ovmf/OVMF.fd"

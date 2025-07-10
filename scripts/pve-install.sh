@@ -19,8 +19,148 @@ fi
 
 echo -e "${CLR_GREEN}Starting Proxmox auto-installation...${CLR_RESET}"
 
+# Function to detect available drives
+detect_drives() {
+    echo -e "${CLR_YELLOW}Detecting available drives...${CLR_RESET}"
+    
+    # Ensure lsblk is available
+    if ! command -v lsblk &> /dev/null; then
+        echo -e "${CLR_RED}lsblk command not found! Please install util-linux package.${CLR_RESET}"
+        exit 1
+    fi
+    
+    # Get all block devices that are drives (not partitions)
+    mapfile -t AVAILABLE_DRIVES < <(lsblk -dpno NAME | grep -E '/dev/(sd|nvme|vd|hd)' | sort)
+    
+    if [ ${#AVAILABLE_DRIVES[@]} -eq 0 ]; then
+        echo -e "${CLR_RED}No suitable drives found! Exiting.${CLR_RESET}"
+        echo -e "${CLR_YELLOW}Looked for drives matching: /dev/sd*, /dev/nvme*, /dev/vd*, /dev/hd*${CLR_RESET}"
+        exit 1
+    fi
+    
+    echo -e "${CLR_YELLOW}Available drives:${CLR_RESET}"
+    for i in "${!AVAILABLE_DRIVES[@]}"; do
+        drive="${AVAILABLE_DRIVES[$i]}"
+        size=$(lsblk -dpno SIZE "$drive" 2>/dev/null || echo "Unknown")
+        model=$(lsblk -dpno MODEL "$drive" 2>/dev/null || echo "Unknown")
+        echo "  $((i+1)). $drive ($size, $model)"
+    done
+}
+
+# Function to get ZFS configuration based on number of drives
+get_zfs_config() {
+    local num_drives=$1
+    
+    case $num_drives in
+        1)
+            echo "single"
+            ;;
+        2)
+            echo "mirror"
+            ;;
+        3|4|5)
+            echo "raidz1"
+            ;;
+        6|7|8|9)
+            echo "raidz2"
+            ;;
+        *)
+            echo "raidz3"
+            ;;
+    esac
+}
+
+# Function to select drives for installation
+select_drives() {
+    detect_drives
+    
+    echo ""
+    echo -e "${CLR_YELLOW}Drive Selection Options:${CLR_RESET}"
+    echo "1. Use all available drives (recommended for maximum redundancy)"
+    echo "2. Select specific drives manually"
+    
+    read -e -p "Choose option (1 or 2): " -i "1" DRIVE_OPTION
+    
+    case $DRIVE_OPTION in
+        1)
+            SELECTED_DRIVES=("${AVAILABLE_DRIVES[@]}")
+            ;;
+        2)
+            echo ""
+            echo "Enter the numbers of drives to use (space-separated, e.g., '1 2 3'):"
+            read -e -p "Drive numbers: " DRIVE_NUMBERS
+            
+            SELECTED_DRIVES=()
+            for num in $DRIVE_NUMBERS; do
+                if [[ $num -ge 1 && $num -le ${#AVAILABLE_DRIVES[@]} ]]; then
+                    SELECTED_DRIVES+=("${AVAILABLE_DRIVES[$((num-1))]}")
+                else
+                    echo -e "${CLR_RED}Invalid drive number: $num${CLR_RESET}"
+                    exit 1
+                fi
+            done
+            ;;
+        *)
+            echo -e "${CLR_RED}Invalid option. Exiting.${CLR_RESET}"
+            exit 1
+            ;;
+    esac
+    
+    # Validate minimum drive requirements
+    if [ ${#SELECTED_DRIVES[@]} -eq 0 ]; then
+        echo -e "${CLR_RED}No drives selected! Exiting.${CLR_RESET}"
+        exit 1
+    fi
+    
+    # Determine ZFS configuration
+    ZFS_RAID=$(get_zfs_config ${#SELECTED_DRIVES[@]})
+    
+    echo ""
+    echo -e "${CLR_GREEN}Selected drives for installation:${CLR_RESET}"
+    for drive in "${SELECTED_DRIVES[@]}"; do
+        size=$(lsblk -dpno SIZE "$drive" 2>/dev/null || echo "Unknown")
+        echo "  - $drive ($size)"
+    done
+    
+    echo ""
+    echo -e "${CLR_GREEN}ZFS Configuration: $ZFS_RAID${CLR_RESET}"
+    
+    # Explain the ZFS configuration
+    case $ZFS_RAID in
+        "single")
+            echo -e "${CLR_YELLOW}Note: Single drive - no redundancy. Consider backup strategy.${CLR_RESET}"
+            ;;
+        "mirror")
+            echo -e "${CLR_YELLOW}Note: Mirror (RAID1) - can survive 1 drive failure.${CLR_RESET}"
+            ;;
+        "raidz1")
+            echo -e "${CLR_YELLOW}Note: RAIDZ1 - can survive 1 drive failure, more space efficient than mirror.${CLR_RESET}"
+            ;;
+        "raidz2")
+            echo -e "${CLR_YELLOW}Note: RAIDZ2 - can survive 2 drive failures, recommended for 6+ drives.${CLR_RESET}"
+            ;;
+        "raidz3")
+            echo -e "${CLR_YELLOW}Note: RAIDZ3 - can survive 3 drive failures, best for large arrays.${CLR_RESET}"
+            ;;
+    esac
+    
+    # Confirm selection
+    echo ""
+    echo -e "${CLR_RED}WARNING: This will COMPLETELY ERASE all data on the selected drives!${CLR_RESET}"
+    echo -e "${CLR_RED}Make sure you have backed up any important data.${CLR_RESET}"
+    echo ""
+    read -e -p "Proceed with this configuration? (y/n): " -i "n" CONFIRM_DRIVES
+    if [[ "$CONFIRM_DRIVES" != "y" ]]; then
+        echo -e "${CLR_YELLOW}Drive selection cancelled. Exiting.${CLR_RESET}"
+        exit 0
+    fi
+}
+
 # Function to get user input
 get_system_inputs() {
+    # Select drives first
+    select_drives
+    
     # Get default interface name and available alternative names first
     DEFAULT_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
     if [ -z "$DEFAULT_INTERFACE" ]; then
@@ -105,7 +245,8 @@ prepare_packages() {
 # Fetch latest Proxmox VE ISO
 get_latest_proxmox_ve_iso() {
     local base_url="https://enterprise.proxmox.com/iso/"
-    local latest_iso=$(curl -s "$base_url" | grep -oP 'proxmox-ve_[0-9]+\.[0-9]+-[0-9]+\.iso' | sort -V | tail -n1)
+    local latest_iso
+    latest_iso=$(curl -s "$base_url" | grep -oP 'proxmox-ve_[0-9]+\.[0-9]+-[0-9]+\.iso' | sort -V | tail -n1)
 
     if [[ -n "$latest_iso" ]]; then
         echo "${base_url}${latest_iso}"
@@ -128,6 +269,28 @@ download_proxmox_iso() {
 
 make_answer_toml() {
     echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
+    
+    # Build disk list for toml format
+    DISK_LIST_TOML=""
+    for i in "${!SELECTED_DRIVES[@]}"; do
+        if [ $i -eq 0 ]; then
+            DISK_LIST_TOML="\"${SELECTED_DRIVES[$i]}\""
+        else
+            DISK_LIST_TOML="${DISK_LIST_TOML}, \"${SELECTED_DRIVES[$i]}\""
+        fi
+    done
+    
+    # Determine filesystem and raid configuration
+    if [ ${#SELECTED_DRIVES[@]} -eq 1 ]; then
+        FILESYSTEM="ext4"
+        RAID_CONFIG=""
+        echo -e "${CLR_YELLOW}Using ext4 filesystem for single drive setup${CLR_RESET}"
+    else
+        FILESYSTEM="zfs"
+        RAID_CONFIG="    zfs.raid = \"$ZFS_RAID\""
+        echo -e "${CLR_YELLOW}Using ZFS filesystem with $ZFS_RAID configuration${CLR_RESET}"
+    fi
+    
     cat <<EOF > answer.toml
 [global]
     keyboard = "en-us"
@@ -142,18 +305,27 @@ make_answer_toml() {
     source = "from-dhcp"
 
 [disk-setup]
-    filesystem = "zfs"
-    zfs.raid = "raid1"
-    disk_list = ["/dev/vda", "/dev/vdb"]
+    filesystem = "$FILESYSTEM"
+$RAID_CONFIG
+    disk_list = [$DISK_LIST_TOML]
 
 EOF
-    echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
+    echo -e "${CLR_GREEN}answer.toml created with ${#SELECTED_DRIVES[@]} drive(s) using $FILESYSTEM${CLR_RESET}"
 }
 
 make_autoinstall_iso() {
     echo -e "${CLR_BLUE}Making autoinstall.iso...${CLR_RESET}"
     proxmox-auto-install-assistant prepare-iso pve.iso --fetch-from iso --answer-file answer.toml --output pve-autoinstall.iso
     echo -e "${CLR_GREEN}pve-autoinstall.iso created.${CLR_RESET}"
+}
+
+# Function to build QEMU drive arguments
+build_qemu_drives() {
+    local drive_args=""
+    for drive in "${SELECTED_DRIVES[@]}"; do
+        drive_args="$drive_args -drive file=$drive,format=raw,media=disk,if=virtio"
+    done
+    echo "$drive_args"
 }
 
 is_uefi_mode() {
@@ -171,6 +343,10 @@ install_proxmox() {
         UEFI_OPTS=""
         echo -e "UEFI Not Supported! Booting in legacy mode."
     fi
+    
+    # Build drive arguments dynamically
+    DRIVE_ARGS=$(build_qemu_drives)
+    
     echo -e "${CLR_YELLOW}Installing Proxmox VE${CLR_RESET}"
 	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
     echo -e "${CLR_RED}Do NOT do anything, just wait about 5-10 min!${CLR_RED}"
@@ -179,8 +355,7 @@ install_proxmox() {
         -enable-kvm $UEFI_OPTS \
         -cpu host -smp 4 -m 4096 \
         -boot d -cdrom ./pve-autoinstall.iso \
-        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-        -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio -no-reboot -display none > /dev/null 2>&1
+        $DRIVE_ARGS -no-reboot -display none > /dev/null 2>&1
 }
 
 # Function to boot the installed Proxmox via QEMU with port forwarding
@@ -194,14 +369,16 @@ boot_proxmox_with_port_forwarding() {
         UEFI_OPTS=""
         echo -e "${CLR_YELLOW}UEFI Not Supported! Booting in legacy mode.${CLR_RESET}"
     fi
-    # UEFI_OPTS=""
+    
+    # Build drive arguments dynamically
+    DRIVE_ARGS=$(build_qemu_drives)
+    
     # Start QEMU in background with port forwarding
     nohup qemu-system-x86_64 -enable-kvm $UEFI_OPTS \
         -cpu host -device e1000,netdev=net0 \
         -netdev user,id=net0,hostfwd=tcp::5555-:22 \
         -smp 4 -m 4096 \
-        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-        -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio \
+        $DRIVE_ARGS \
         > qemu_output.log 2>&1 &
     
     QEMU_PID=$!
